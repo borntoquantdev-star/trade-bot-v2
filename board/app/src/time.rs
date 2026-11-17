@@ -217,6 +217,54 @@ pub fn stamp(iso: &str) -> String {
         .unwrap_or_else(|| iso.to_owned())
 }
 
+/// The months as a Thai person writes them next to a day number.
+pub const MONTHS_SHORT: [&str; 12] = [
+    "ม.ค.",
+    "ก.พ.",
+    "มี.ค.",
+    "เม.ย.",
+    "พ.ค.",
+    "มิ.ย.",
+    "ก.ค.",
+    "ส.ค.",
+    "ก.ย.",
+    "ต.ค.",
+    "พ.ย.",
+    "ธ.ค.",
+];
+
+/// How many years the Buddhist Era is ahead of the Gregorian one.
+pub const BUDDHIST_YEARS: i64 = 543;
+
+/// `17 พ.ย. 2569 20:14` for an ISO timestamp: the day without a leading zero,
+/// the short Thai month, the Buddhist year, and the Thai wall clock. The
+/// empty string for anything that is not a timestamp, so a card prints a gap
+/// rather than a wrong date.
+pub fn thai_stamp(iso: &str) -> String {
+    let Some(at) = local(iso) else {
+        return String::new();
+    };
+    format!(
+        "{} {} {} {:02}:{:02}",
+        at.day,
+        MONTHS_SHORT[(at.month - 1) as usize],
+        at.year + BUDDHIST_YEARS,
+        at.hour,
+        at.minute
+    )
+}
+
+/// `20261117-2014` for a Unix time: the Thai date and time in the order a
+/// file manager sorts them. Gregorian on purpose - this is for file names,
+/// and a name that sorts the same either way is not worth a second calendar.
+pub fn file_stamp(unix: f64) -> String {
+    let at = from_seconds(unix.floor() as i64 + OFFSET_HOURS * 3600);
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}",
+        at.year, at.month, at.day, at.hour, at.minute
+    )
+}
+
 /// `23:47` for an ISO timestamp, or an empty string.
 pub fn hhmm(iso: &str) -> String {
     local(iso).map(|at| at.hhmm()).unwrap_or_default()
@@ -337,6 +385,56 @@ mod tests {
             utc_seconds("2026-11-13T23:47:11+07:00")
         );
         assert_eq!(utc_seconds("2026-11-13T16:47:11Z"), Some(1_794_588_431));
+    }
+
+    #[test]
+    fn a_thai_stamp_is_buddhist_year_short_month_and_thai_time() {
+        // The example on the submission card: 17 November 2026, a quarter
+        // past one in the afternoon UTC is twenty past eight in Bangkok.
+        assert_eq!(
+            thai_stamp("2026-11-17T13:14:00+00:00"),
+            "17 พ.ย. 2569 20:14"
+        );
+        // A single-digit day has no zero in front of it, the clock does.
+        assert_eq!(thai_stamp("2026-03-05T01:02:00Z"), "5 มี.ค. 2569 08:02");
+    }
+
+    #[test]
+    fn a_thai_stamp_rolls_the_year_over_in_thai_time_not_in_utc() {
+        assert_eq!(thai_stamp("2026-12-31T20:30:00+00:00"), "1 ม.ค. 2570 03:30");
+        assert_eq!(
+            thai_stamp("2026-12-31T16:59:00+00:00"),
+            "31 ธ.ค. 2569 23:59"
+        );
+    }
+
+    #[test]
+    fn something_that_is_not_a_time_has_no_thai_stamp() {
+        assert_eq!(thai_stamp(""), "");
+        assert_eq!(thai_stamp("soon"), "");
+    }
+
+    #[test]
+    fn every_month_has_a_short_name_and_they_are_all_different() {
+        let mut seen = std::collections::BTreeSet::new();
+        for month in 1..=12 {
+            let stamp = thai_stamp(&format!("2026-{month:02}-15T05:00:00Z"));
+            assert!(!stamp.is_empty(), "{month}");
+            seen.insert(MONTHS_SHORT[month - 1]);
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn a_file_stamp_is_thai_time_in_a_sortable_order() {
+        let at = utc_seconds("2026-11-17T13:14:59+00:00").unwrap() as f64;
+        assert_eq!(file_stamp(at), "20261117-2014");
+        let after_midnight = utc_seconds("2026-11-17T17:05:00+00:00").unwrap() as f64;
+        assert_eq!(
+            file_stamp(after_midnight),
+            "20261118-0005",
+            "ตี 0:05 ของวันถัดไป"
+        );
     }
 
     #[test]

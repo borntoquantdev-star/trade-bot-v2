@@ -5,6 +5,9 @@ config.yaml
 .env.*
 bot/.env
 config/.env
+# The student's name for the board's submission card: a person, not a secret,
+# but not the repository's either.
+config/student.json
 logs/
 # Downloaded price history: reproducible with --fetch-candles,
 # and large enough to make a repository unpleasant to clone.

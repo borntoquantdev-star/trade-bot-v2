@@ -1306,3 +1306,139 @@ async fn a_finished_job_or_a_changed_strategy_file_makes_the_listing_stale() {
     wait_for_listing(&control).await;
     assert_eq!(control.lock().strategies.last_attempt, fourth);
 }
+
+// -- the student's name ----------------------------------------------------------
+
+#[tokio::test]
+async fn the_name_is_stored_beside_the_keys_and_comes_back_in_the_snapshot() {
+    let scratch = Scratch::new("student");
+    let control = controller(&scratch, quick().0, KILL_AFTER);
+    let app = routes(control, Account::default());
+
+    let (_, before) = send(&app, request("GET", "/api/control", &[], "")).await;
+    assert_eq!(
+        before["student"],
+        json!({ "name": "" }),
+        "no name yet is an empty one"
+    );
+
+    let (status, reply) = send(
+        &app,
+        post("/api/control/student", r#"{"name": "  สมชาย ใจดี  "}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["student"], json!({ "name": "สมชาย ใจดี" }));
+
+    let file = scratch.0.join("config").join("student.json");
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        written.contains("สมชาย ใจดี"),
+        "Thai is written as Thai: {written}"
+    );
+    assert!(!written.contains("\\u"), "not escaped: {written}");
+    assert!(
+        !scratch.env().exists(),
+        "the name is not a key and must not create the keys file"
+    );
+
+    // It survives the process: a new controller on the same folder reads it.
+    let again = routes(
+        controller(&scratch, quick().0, KILL_AFTER),
+        Account::default(),
+    );
+    let (_, later) = send(&again, request("GET", "/api/control", &[], "")).await;
+    assert_eq!(later["student"]["name"], "สมชาย ใจดี");
+}
+
+#[tokio::test]
+async fn an_empty_name_takes_the_name_back_off() {
+    let scratch = Scratch::new("student-clear");
+    let app = routes(
+        controller(&scratch, quick().0, KILL_AFTER),
+        Account::default(),
+    );
+    send(&app, post("/api/control/student", r#"{"name": "สมชาย"}"#)).await;
+    let (status, reply) = send(&app, post("/api/control/student", r#"{"name": "   "}"#)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply["student"]["name"], "");
+}
+
+#[tokio::test]
+async fn a_bad_name_is_refused_and_the_old_one_stays() {
+    let scratch = Scratch::new("student-bad");
+    let app = routes(
+        controller(&scratch, quick().0, KILL_AFTER),
+        Account::default(),
+    );
+    send(&app, post("/api/control/student", r#"{"name": "สมชาย"}"#)).await;
+
+    let too_long = json!({ "name": "ก".repeat(61) }).to_string();
+    for body in [
+        r#"{"name": "สมชาย\nใจดี"}"#,
+        r#"{"name": "สมชาย\tใจดี"}"#,
+        r#"{"name": 7}"#,
+        r#"{}"#,
+        "not json",
+        too_long.as_str(),
+    ] {
+        let (status, reply) = send(&app, post("/api/control/student", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+    }
+    let (_, now) = send(&app, request("GET", "/api/control", &[], "")).await;
+    assert_eq!(
+        now["student"]["name"], "สมชาย",
+        "a refused name changes nothing"
+    );
+}
+
+/// The name route stands behind the same door as every other POST.
+#[tokio::test]
+async fn the_name_route_needs_the_control_header_and_the_loopback_host() {
+    let scratch = Scratch::new("student-door");
+    let app = routes(
+        controller(&scratch, quick().0, KILL_AFTER),
+        Account::default(),
+    );
+    let bare = request("POST", "/api/control/student", &[], r#"{"name":"x"}"#);
+    let (status, _) = send(&app, bare).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no x-board-control header");
+
+    let foreign = request(
+        "POST",
+        "/api/control/student",
+        &[("x-board-control", "1"), ("host", "evil.example")],
+        r#"{"name":"x"}"#,
+    );
+    let (status, _) = send(&app, foreign).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a rebinding page is not the board"
+    );
+
+    let crossed = request(
+        "POST",
+        "/api/control/student",
+        &[("x-board-control", "1"), ("origin", "http://evil.example")],
+        r#"{"name":"x"}"#,
+    );
+    let (status, _) = send(&app, crossed).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an Origin that is not this server"
+    );
+    assert!(!scratch.0.join("config").join("student.json").exists());
+}
+
+#[tokio::test]
+async fn a_hand_edited_name_file_that_is_not_valid_reads_as_no_name() {
+    let scratch = Scratch::new("student-edited");
+    let file = scratch.0.join("config").join("student.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{ this is not json").unwrap();
+    let control = controller(&scratch, quick().0, KILL_AFTER);
+    let snapshot = control.snapshot().await;
+    assert_eq!(snapshot["student"]["name"], "");
+}

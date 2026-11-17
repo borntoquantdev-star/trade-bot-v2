@@ -42,6 +42,7 @@ mod history;
 mod kline;
 pub mod launcher;
 mod market;
+pub mod student;
 mod trace;
 
 #[derive(Clone)]

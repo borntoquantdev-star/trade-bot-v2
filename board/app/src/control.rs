@@ -16,6 +16,13 @@
 //! value back (only "is it set"), and this module never prints, logs or
 //! formats what was typed: the fields are drawn masked, and the form's
 //! `Debug` says nothing about its contents.
+//!
+//! Under the keys sits the **submission card** band: the student's name (the
+//! one thing here the server does send back, because it is not a secret),
+//! a choice of the last few runs, a small preview and the button that saves
+//! the picture. What goes on the card and where is `submission.rs`; this
+//! module only gathers what it is made of (the runs and ticks the board
+//! already holds, the strategies' check state, the name) and draws the form.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -24,6 +31,9 @@ use egui::{Color32, FontId, Rect, RichText, Ui, UiBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::bot::Row;
+use crate::history::Run;
+use crate::submission::{self, SaveEvent, SaveStatus};
 use crate::{api, theme};
 
 /// The header every POST must carry. The server refuses a state-changing
@@ -261,8 +271,14 @@ const CASE_STUDIES: [(&str, &str, &str); 2] = [
     ),
 ];
 
+/// Is this one of the two worked examples rather than something a student
+/// wrote? The submission card uses it to decide whether "เขียนเอง" is ticked.
+pub fn is_case_study(name: &str) -> bool {
+    CASE_STUDIES.iter().any(|case| case.0 == name)
+}
+
 /// Only there to prove the plumbing works; never offered.
-const HIDDEN_STRATEGY: &str = "random";
+pub const HIDDEN_STRATEGY: &str = "random";
 
 /// Strategies of the student's own that are listed before the rest are
 /// summed up in a line, so the card cannot grow without end.
@@ -333,6 +349,24 @@ pub fn pick_rows(strategies: &Strategies) -> (Vec<PickRow>, usize) {
     (rows, left_out)
 }
 
+/// The name the submission card carries, as the server keeps it. Not a
+/// secret, unlike everything else the server holds for the panel.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Student {
+    #[serde(default)]
+    pub name: String,
+}
+
+/// What the panel is shown that does not come from its own server route: the
+/// board's runs (`/api/runs`) and the newest ticks (`/api/audit`). The
+/// submission card is made of them. Borrowed, so that passing them in costs
+/// nothing even though the ticks are five hundred rows.
+#[derive(Default, Clone, Copy)]
+pub struct Evidence<'a> {
+    pub runs: &'a [Run],
+    pub rows: &'a [Row],
+}
+
 /// One answer from `GET /api/control`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Snapshot {
@@ -349,6 +383,9 @@ pub struct Snapshot {
     /// `None` until the server has listed the strategies once.
     #[serde(default)]
     pub strategies: Option<Strategies>,
+    /// Who the submission card is for. Empty until a name has been saved.
+    #[serde(default)]
+    pub student: Student,
 }
 
 impl Snapshot {
@@ -436,6 +473,8 @@ pub enum Kind {
     Check,
     Resume,
     Keys,
+    /// Keep the student's name for the submission card.
+    Student,
 }
 
 impl Kind {
@@ -446,6 +485,7 @@ impl Kind {
             Kind::Check => "/api/control/check",
             Kind::Resume => "/api/control/resume",
             Kind::Keys => "/api/control/keys",
+            Kind::Student => "/api/control/student",
         }
     }
 }
@@ -619,6 +659,8 @@ impl Reply {
 enum Got {
     Status(Result<Reply, String>),
     Done(Kind, Result<Reply, String>),
+    /// The browser said something about the picture being saved.
+    Save(SaveEvent),
 }
 
 fn answer(result: Result<ehttp::Response, String>) -> Result<Reply, String> {
@@ -655,6 +697,15 @@ pub struct Control {
     /// The strategy picked in the list. Only a request to start or check
     /// sends it; see `selected`.
     pick: Option<String>,
+    /// The name being typed, until the server has it. `None` means the field
+    /// shows the saved name.
+    name_edit: Option<String>,
+    /// The id of the run chosen for the submission card; the newest one when
+    /// it is `None` or no longer offered.
+    submit_pick: Option<String>,
+    /// How saving the picture is going, and what the file is called.
+    save: SaveStatus,
+    save_file: String,
     note: Option<Note>,
     tx: Sender<Got>,
     rx: Receiver<Got>,
@@ -674,6 +725,10 @@ impl Default for Control {
             form: Form::default(),
             checked: None,
             pick: None,
+            name_edit: None,
+            submit_pick: None,
+            save: SaveStatus::default(),
+            save_file: String::new(),
             note: None,
             tx,
             rx,
@@ -734,6 +789,10 @@ impl Control {
                 Got::Done(kind, reply) => {
                     self.post = None;
                     self.finish(kind, reply, now);
+                }
+                Got::Save(event) => {
+                    let file = self.save_file.clone();
+                    self.save.apply(event, &file);
                 }
             }
         }
@@ -912,6 +971,7 @@ impl Control {
                         )
                     }
                     Kind::Stop => ("ส่งคำสั่งหยุดแล้ว · บอทกำลังปิดไม้ก่อนออก".to_owned(), true),
+                    Kind::Student => ("บันทึกชื่อแล้ว".to_owned(), true),
                     Kind::Run | Kind::Check | Kind::Resume => (String::new(), true),
                 }
             }
@@ -1013,7 +1073,7 @@ impl Control {
     // -------------------------------------------------------------- the card
 
     /// The inside of the card.
-    pub fn body(&mut self, ui: &mut Ui, now: f64) {
+    pub fn body(&mut self, ui: &mut Ui, now: f64, evidence: Evidence) {
         self.expire_note(now);
         let whole = ui.max_rect();
         let top_down = egui::Layout::top_down(egui::Align::Min);
@@ -1047,11 +1107,19 @@ impl Control {
             })
             .response
             .rect;
-        // The output takes whatever the two columns above it leave.
-        let below = Rect::from_min_max(
+        // The submission card sits under them, the full width, and the output
+        // takes whatever both leave.
+        let band = Rect::from_min_max(
             egui::pos2(area.min.x, used_left.max.y.max(used_right.max.y) + 10.0),
             area.max,
         );
+        let used_band = ui
+            .scope_builder(UiBuilder::new().max_rect(band).layout(top_down), |ui| {
+                self.submit_band(ui, now, evidence)
+            })
+            .response
+            .rect;
+        let below = Rect::from_min_max(egui::pos2(area.min.x, used_band.max.y + 10.0), area.max);
         if below.height() > 48.0 {
             ui.scope_builder(UiBuilder::new().max_rect(below).layout(top_down), |ui| {
                 self.output(ui)
@@ -1330,7 +1398,11 @@ impl Control {
                     .color(theme::WARN),
             );
         }
-        if let Some(note) = self.note.as_ref().filter(|note| note.kind != Kind::Keys) {
+        if let Some(note) = self
+            .note
+            .as_ref()
+            .filter(|note| !matches!(note.kind, Kind::Keys | Kind::Student))
+        {
             ui.label(
                 RichText::new(&note.text)
                     .size(11.0)
@@ -1430,6 +1502,283 @@ impl Control {
         }
     }
 
+    // ------------------------------------------------------- the submission
+
+    /// The name as the field shows it: what is being typed, else what the
+    /// server has kept.
+    fn typed_name(&self) -> String {
+        self.name_edit
+            .clone()
+            .unwrap_or_else(|| self.snapshot.student.name.clone())
+    }
+
+    /// What the bot's own list says about a strategy, today. `Unknown` for a
+    /// name the list does not have (a file deleted since the run).
+    fn check_of(&self, strategy: &str) -> CheckState {
+        self.snapshot
+            .strategies
+            .as_ref()
+            .and_then(|strategies| strategies.list.iter().find(|row| row.name == strategy))
+            .map_or(CheckState::Unknown, StrategyRow::check_state)
+    }
+
+    /// The runs a card can be made of, and the one that is chosen: the pick
+    /// if it is still on offer, else the newest.
+    fn submit_choice<'a>(&self, evidence: &Evidence<'a>) -> (Vec<&'a Run>, Option<&'a Run>) {
+        let offered = submission::eligible(evidence.runs);
+        let chosen = self
+            .submit_pick
+            .as_deref()
+            .and_then(|id| offered.iter().copied().find(|run| run.id == id))
+            .or_else(|| offered.first().copied());
+        (offered, chosen)
+    }
+
+    /// The id of the run the bot is making at this moment, if it is making
+    /// one: the newest run of all, while a run job is going and that run has
+    /// no closing line. A check or an unlock does not make a run.
+    fn running_run_id<'a>(&self, evidence: &Evidence<'a>) -> Option<&'a str> {
+        if !self
+            .snapshot
+            .running_job()
+            .is_some_and(|job| job.action == "run")
+        {
+            return None;
+        }
+        evidence
+            .runs
+            .first()
+            .filter(|run| !run.finished)
+            .map(|run| run.id.as_str())
+    }
+
+    fn card_for(&self, run: &Run, name: &str, evidence: &Evidence) -> Option<submission::Card> {
+        submission::build(&submission::Inputs {
+            name,
+            run,
+            check: self.check_of(&run.strategy),
+            running: self.running_run_id(evidence) == Some(run.id.as_str()),
+            rows: evidence.rows,
+            now_unix: crate::time::now_unix(),
+        })
+    }
+
+    /// Why the save button cannot be pressed, in a sentence, or `None` when
+    /// it can.
+    fn submit_blocker(
+        &self,
+        offered: &[&Run],
+        name: &Result<String, submission::NameProblem>,
+    ) -> Option<&'static str> {
+        if offered.is_empty() {
+            return Some("ยังไม่มีรอบให้ส่ง · กดเริ่มบอทให้บอทรันสักรอบก่อน แล้วกลับมาที่นี่");
+        }
+        match name {
+            Err(problem) => Some(problem.say()),
+            Ok(name) if name.is_empty() => Some("ใส่ชื่อ-นามสกุลก่อน แล้วปุ่มนี้จะกดได้"),
+            Ok(_) if self.save.busy() => Some("กำลังสร้างรูป..."),
+            Ok(_) => None,
+        }
+    }
+
+    /// The submission card's own band across the control card: the student's
+    /// name, which run, the button, and a small picture of what will be saved.
+    fn submit_band(&mut self, ui: &mut Ui, now: f64, evidence: Evidence) {
+        // The server has the name now: stop showing what was typed.
+        if self.name_edit.as_deref() == Some(self.snapshot.student.name.as_str()) {
+            self.name_edit = None;
+        }
+        let whole = ui.max_rect();
+        let top_down = egui::Layout::top_down(egui::Align::Min);
+        let preview_width = (whole.width() * 0.36).clamp(260.0, 420.0);
+        let gap = 22.0;
+        let left = Rect::from_min_size(
+            whole.min,
+            egui::vec2(whole.width() - preview_width - gap, whole.height()),
+        );
+        let right = Rect::from_min_size(
+            egui::pos2(whole.max.x - preview_width, whole.min.y),
+            egui::vec2(preview_width, whole.height()),
+        );
+
+        let typed = self.typed_name();
+        let cleaned = submission::clean_name(&typed);
+        let name = cleaned.clone().unwrap_or_default();
+        let (offered, chosen) = self.submit_choice(&evidence);
+        // A card is shown as soon as there is a run to make it of: with no
+        // name yet it carries a stand-in, and the button stays shut.
+        let shown_name = if name.is_empty() {
+            "ชื่อ-นามสกุล"
+        } else {
+            name.as_str()
+        };
+        let card = chosen.and_then(|run| self.card_for(run, shown_name, &evidence));
+        let blocker = self.submit_blocker(&offered, &cleaned);
+        let running = self.running_run_id(&evidence);
+
+        ui.scope_builder(UiBuilder::new().max_rect(left).layout(top_down), |ui| {
+            let shown = Shown {
+                offered: &offered,
+                chosen,
+                running,
+                card: card.as_ref(),
+                name: &cleaned,
+                blocker,
+            };
+            self.submit_controls(ui, now, &shown)
+        });
+        ui.scope_builder(UiBuilder::new().max_rect(right).layout(top_down), |ui| {
+            section(ui, "ตัวอย่างการ์ด · ไฟล์จริงขนาด 1200 x 675");
+            let size = egui::vec2(
+                preview_width,
+                preview_width * submission::HEIGHT / submission::WIDTH,
+            );
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            match &card {
+                Some(card) => submission::paint(&painter, rect, &submission::layout(card)),
+                None => {
+                    painter.rect(
+                        rect,
+                        8,
+                        theme::HEAD,
+                        theme::line(),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "การ์ดจะขึ้นตรงนี้เมื่อบอทรันครบหนึ่งรอบ",
+                        FontId::proportional(11.0),
+                        theme::FAINT,
+                    );
+                }
+            }
+        });
+    }
+
+    fn submit_controls(&mut self, ui: &mut Ui, now: f64, shown: &Shown) {
+        let Shown {
+            offered,
+            chosen,
+            running,
+            card,
+            name: cleaned,
+            blocker,
+        } = *shown;
+        ui.spacing_mut().item_spacing.y = 5.0;
+        section(ui, "ส่งงาน · บันทึกรูปสรุปรอบที่ผ่านมา ให้ครูดู");
+        ui.label(
+            RichText::new("ชื่อ-นามสกุล · จะขึ้นบนการ์ด พิมพ์ครั้งเดียว เครื่องจำให้")
+                .size(11.0)
+                .color(theme::MUTED),
+        );
+
+        let saved = self.snapshot.student.name.clone();
+        let posting = api::still_waiting(self.post.map(|(_, at)| at), now);
+        let name = cleaned.clone().unwrap_or_default();
+        let can_save_name = cleaned.is_ok() && name != saved && !posting;
+        let mut typed = self.typed_name();
+        let mut edited = false;
+        let mut save_name = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut typed)
+                    .id_salt("control_student_name")
+                    .char_limit(submission::NAME_MAX_CHARS)
+                    .desired_width(250.0)
+                    .background_color(OUTPUT_FILL)
+                    .text_color(theme::TEXT)
+                    .hint_text(
+                        RichText::new("เช่น สมชาย ใจดี")
+                            .size(11.0)
+                            .color(theme::FAINT),
+                    ),
+            );
+            edited = field.changed();
+            let enter = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            save_name = (ui
+                .add_enabled(can_save_name, neutral_button("บันทึกชื่อ"))
+                .clicked())
+                || (enter && can_save_name);
+        });
+        if edited {
+            self.name_edit = Some(typed);
+        }
+        if save_name {
+            self.send(Kind::Student, json!({ "name": name }), now);
+        }
+        if let Err(problem) = cleaned {
+            ui.label(RichText::new(problem.say()).size(11.0).color(theme::BAD));
+        }
+        // One line is always set aside for the answer to "save name", so the
+        // band does not jump down and up under the student's mouse.
+        match self.note.as_ref().filter(|note| note.kind == Kind::Student) {
+            Some(note) => ui.label(
+                RichText::new(&note.text)
+                    .size(11.0)
+                    .color(note_colour(note)),
+            ),
+            None => ui.label(RichText::new(" ").size(11.0)),
+        };
+
+        ui.add_space(2.0);
+        section(ui, "รอบที่จะใส่ในการ์ด · 5 รอบล่าสุด");
+        if !offered.is_empty() {
+            let mut pick = chosen.map(|run| run.id.clone());
+            for run in offered {
+                ui.radio_value(
+                    &mut pick,
+                    Some(run.id.clone()),
+                    RichText::new(run_label(run, running == Some(run.id.as_str()))).size(11.0),
+                );
+            }
+            self.submit_pick = pick;
+        }
+
+        ui.add_space(2.0);
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            clicked = ui
+                .add_enabled(
+                    blocker.is_none(),
+                    action_button("บันทึกรูปส่งงาน", theme::ACCENT),
+                )
+                .clicked();
+        });
+        if let Some(why) = blocker {
+            ui.label(RichText::new(why).size(10.5).color(theme::DIM));
+        }
+        if let Some((line, good)) = self.save.line() {
+            ui.label(RichText::new(line).size(11.0).color(if good {
+                theme::OK
+            } else {
+                theme::BAD
+            }));
+        }
+        if clicked {
+            if let Some(card) = card {
+                self.start_save(card, &name, &saved, now);
+            }
+        }
+    }
+
+    /// Draw the card in the browser, save it, and keep the name beside the
+    /// keys if it was changed.
+    fn start_save(&mut self, card: &submission::Card, name: &str, saved: &str, now: f64) {
+        let file = submission::file_name(name, crate::time::now_unix().unwrap_or(0.0));
+        self.save = SaveStatus::Working;
+        self.save_file = file.clone();
+        let tx = self.tx.clone();
+        submission::save_png(submission::layout(card), file, move |event| {
+            let _ = tx.send(Got::Save(event));
+        });
+        if name != saved {
+            self.send(Kind::Student, json!({ "name": name }), now);
+        }
+    }
+
     /// The last lines the bot (or the installer) printed.
     fn output(&self, ui: &mut Ui) {
         let heading = if self.snapshot.setup.state == SetupState::Ready {
@@ -1472,6 +1821,37 @@ impl Control {
                 });
         });
     }
+}
+
+/// What the left side of the submission band is drawn from. A bundle so that
+/// the drawing function takes one argument and not seven.
+#[derive(Clone, Copy)]
+struct Shown<'a> {
+    offered: &'a [&'a Run],
+    chosen: Option<&'a Run>,
+    running: Option<&'a str>,
+    card: Option<&'a submission::Card>,
+    name: &'a Result<String, submission::NameProblem>,
+    blocker: Option<&'static str>,
+}
+
+/// One run as a line of the picker: when it began, what it ran on, which
+/// strategy, how many trades - and if it is going or was cut short.
+fn run_label(run: &Run, running: bool) -> String {
+    let mode = submission::card_mode(&run.mode).map_or("", |mode| mode.word());
+    let tag = if running {
+        " · กำลังรัน"
+    } else if !run.finished {
+        " · ยังไม่จบ"
+    } else {
+        ""
+    };
+    format!(
+        "{} · {mode} · {} · {} ไม้{tag}",
+        crate::time::thai_stamp(&run.started_at),
+        run.strategy,
+        submission::trades_of(run),
+    )
 }
 
 /// A request body with the picked strategy in it, if there is one.
@@ -1611,7 +1991,9 @@ mod tests {
         warm.textures_delta.clear();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let area = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1076.0, 560.0));
-            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| control.body(ui, now));
+            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                control.body(ui, now, Evidence::default())
+            });
         });
         output.textures_delta.clear();
 
@@ -1629,8 +2011,8 @@ mod tests {
         found
     }
 
-    /// The height the card hands `body`: the slot's 700, less the card's head and padding (30 + 10 + 10).
-    const SLOT_BODY_HEIGHT: f32 = 650.0;
+    /// The height the card hands `body`: the slot's 950, less the card's head and padding (30 + 10 + 10).
+    const SLOT_BODY_HEIGHT: f32 = 900.0;
 
     /// Every piece of text one frame painted, with the y it was painted at.
     fn painted_at(control: &mut Control, now: f64) -> Vec<(String, f32)> {
@@ -1641,7 +2023,9 @@ mod tests {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let area =
                 Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1076.0, SLOT_BODY_HEIGHT));
-            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| control.body(ui, now));
+            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                control.body(ui, now, Evidence::default())
+            });
         });
         output.textures_delta.clear();
 
@@ -1661,6 +2045,36 @@ mod tests {
 
     fn screen(control: &mut Control) -> String {
         painted(control, 1.0).join(" | ")
+    }
+
+    /// Every piece of text one frame painted, with the board runs and ticks
+    /// handed in the way `Board::control_card` does.
+    fn painted_with(control: &mut Control, evidence: Evidence) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx);
+        let mut warm = ctx.run_ui(egui::RawInput::default(), |_| {});
+        warm.textures_delta.clear();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let area =
+                Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1076.0, SLOT_BODY_HEIGHT));
+            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                control.body(ui, 1.0, evidence)
+            });
+        });
+        output.textures_delta.clear();
+
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => found.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
     }
 
     // ------------------------------------------------- is it there at all?
@@ -2927,6 +3341,338 @@ mod tests {
             SLOT_BODY_HEIGHT - heading >= 90.0,
             "กล่องข้อความเหลือที่ {} px จาก {SLOT_BODY_HEIGHT}",
             SLOT_BODY_HEIGHT - heading
+        );
+    }
+
+    // -------------------------------------------------- the submission card
+
+    fn a_finished_run(id: &str, strategy: &str, mode: &str, minute: u32) -> Run {
+        Run {
+            id: id.into(),
+            started_at: format!("2026-11-17T10:{minute:02}:00+00:00"),
+            ended_at: format!("2026-11-17T10:{:02}:30+00:00", minute + 20),
+            strategy: strategy.into(),
+            symbol: "BTC_USDT_Perp".into(),
+            mode: mode.into(),
+            orders: 3,
+            exits: 3,
+            first_equity: "10000".into(),
+            change: Some(-40.0),
+            finished: true,
+            ..Default::default()
+        }
+    }
+
+    /// An answer that has the strategies listed and a name saved.
+    fn with_student(job: Value, name: &str) -> Control {
+        let listed = with_strategies(job, &[("ping_pong", Some(true)), ("mine", Some(true))]);
+        let mut body: Value = serde_json::from_str(&listed).unwrap();
+        body["student"] = json!({ "name": name });
+        available(&body.to_string())
+    }
+
+    fn evidence_of(runs: &[Run]) -> Evidence<'_> {
+        Evidence { runs, rows: &[] }
+    }
+
+    #[test]
+    fn the_panel_carries_the_name_the_server_kept() {
+        let control = with_student(Value::Null, "สมชาย ใจดี");
+        assert_eq!(control.snapshot.student.name, "สมชาย ใจดี");
+        assert_eq!(control.typed_name(), "สมชาย ใจดี");
+        // An older server says nothing about a name: that is an empty one.
+        assert_eq!(available(READY).snapshot.student.name, "");
+    }
+
+    #[test]
+    fn what_is_being_typed_shows_until_the_server_has_it() {
+        let mut control = with_student(Value::Null, "สมชาย");
+        control.name_edit = Some("สมชาย ใจ".into());
+        assert_eq!(control.typed_name(), "สมชาย ใจ");
+        // The server answers with the same name: the field goes back to
+        // showing the saved one.
+        let listed = with_strategies(Value::Null, &THREE);
+        let mut body: Value = serde_json::from_str(&listed).unwrap();
+        body["student"] = json!({ "name": "สมชาย ใจ" });
+        control.accept(reply(200, &body.to_string()), 2.0);
+        painted_with(&mut control, Evidence::default());
+        assert_eq!(control.name_edit, None);
+        assert_eq!(control.typed_name(), "สมชาย ใจ");
+    }
+
+    #[test]
+    fn the_name_goes_to_its_own_route_as_json() {
+        assert_eq!(Kind::Student.path(), "/api/control/student");
+        let request = post(Kind::Student.path(), &json!({ "name": "สมชาย" }));
+        assert_eq!(request.method, ehttp::Method::POST);
+        assert!(
+            request.url.ends_with("/api/control/student"),
+            "{}",
+            request.url
+        );
+        assert_eq!(request.headers.get(HEADER), Some("1"));
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(sent, json!({ "name": "สมชาย" }));
+    }
+
+    #[test]
+    fn with_no_runs_the_button_is_shut_and_says_to_run_the_bot_first() {
+        let control = with_student(Value::Null, "สมชาย");
+        let why = control.submit_blocker(&[], &Ok("สมชาย".into())).unwrap();
+        assert!(
+            why.contains("ยังไม่มีรอบให้ส่ง") && why.contains("กดเริ่มบอท"),
+            "{why}"
+        );
+
+        let mut control = with_student(Value::Null, "สมชาย");
+        let text = painted_with(&mut control, Evidence::default()).join(" | ");
+        assert!(text.contains("บันทึกรูปส่งงาน"), "the button is there: {text}");
+        assert!(text.contains("ยังไม่มีรอบให้ส่ง"), "{text}");
+        assert!(text.contains("การ์ดจะขึ้นตรงนี้เมื่อบอทรันครบหนึ่งรอบ"), "{text}");
+    }
+
+    #[test]
+    fn without_a_name_the_button_stays_shut_even_with_runs() {
+        let control = with_student(Value::Null, "");
+        let run = a_finished_run("a", "mine", "paper", 0);
+        let offered = vec![&run];
+        let why = control
+            .submit_blocker(&offered, &Ok(String::new()))
+            .unwrap();
+        assert!(why.contains("ใส่ชื่อ"), "{why}");
+        assert!(control
+            .submit_blocker(&offered, &Ok("สมชาย".into()))
+            .is_none());
+        let bad = control
+            .submit_blocker(&offered, &Err(submission::NameProblem::TooLong))
+            .unwrap();
+        assert!(bad.contains("60"), "{bad}");
+    }
+
+    #[test]
+    fn a_picture_in_progress_blocks_a_second_press() {
+        let mut control = with_student(Value::Null, "สมชาย");
+        control.save = SaveStatus::Working;
+        let run = a_finished_run("a", "mine", "paper", 0);
+        let why = control.submit_blocker(&[&run], &Ok("สมชาย".into()));
+        assert!(why.is_some_and(|why| why.contains("กำลังสร้างรูป")));
+    }
+
+    #[test]
+    fn the_picker_lists_the_last_five_newest_first_and_hides_random() {
+        let mut runs: Vec<Run> = (0..7)
+            .map(|n| a_finished_run(&format!("r{n}"), "mine", "paper", n))
+            .collect();
+        runs.push(a_finished_run("hidden", "random", "paper", 30));
+        runs.reverse();
+        let mut control = with_student(Value::Null, "สมชาย");
+        let text = painted_with(&mut control, evidence_of(&runs));
+        let rows: Vec<&String> = text
+            .iter()
+            .filter(|line| line.starts_with("17 พ.ย."))
+            .collect();
+        assert_eq!(rows.len(), 5, "{text:?}");
+        assert!(
+            rows[0].contains("17 พ.ย. 2569 17:06"),
+            "newest first: {rows:?}"
+        );
+        assert!(rows[0].contains("กระดาษ") && rows[0].contains("mine") && rows[0].contains("3 ไม้"));
+        assert!(!text.iter().any(|line| line.contains("random")), "{text:?}");
+    }
+
+    #[test]
+    fn the_newest_run_is_the_default_and_a_pick_is_kept_while_it_is_offered() {
+        let runs: Vec<Run> = (0..3)
+            .map(|n| a_finished_run(&format!("r{n}"), "mine", "paper", n))
+            .collect();
+        let mut control = with_student(Value::Null, "สมชาย");
+        let id = |control: &Control| {
+            control
+                .submit_choice(&evidence_of(&runs))
+                .1
+                .map(|run| run.id.clone())
+        };
+        assert_eq!(id(&control).as_deref(), Some("r2"));
+        control.submit_pick = Some("r0".into());
+        assert_eq!(id(&control).as_deref(), Some("r0"));
+        control.submit_pick = Some("gone".into());
+        assert_eq!(
+            id(&control).as_deref(),
+            Some("r2"),
+            "a pick that is no longer offered falls back to the newest"
+        );
+    }
+
+    #[test]
+    fn the_preview_carries_the_name_the_badges_and_the_case_study_word() {
+        let runs = vec![a_finished_run("a", "ping_pong", "paper", 0)];
+        let mut control = with_student(Value::Null, "สมชาย ใจดี");
+        let text = painted_with(&mut control, evidence_of(&runs));
+        for want in [
+            "สมชาย ใจดี",
+            "กลยุทธ์: ping_pong (กรณีศึกษา)",
+            "เขียนเอง",
+            "ผ่านด่าน",
+            "3 ไม้",
+        ] {
+            assert!(text.iter().any(|line| line == want), "{want}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn the_check_badge_follows_the_strategy_list_not_the_run() {
+        let runs = vec![a_finished_run("a", "mine", "paper", 0)];
+        let passed = with_student(Value::Null, "สมชาย");
+        assert_eq!(passed.check_of("mine"), CheckState::Passed);
+        let card = passed
+            .card_for(&runs[0], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        assert!(card.badges()[1].done);
+
+        let body = with_strategies(Value::Null, &[("mine", Some(false))]);
+        let failed = available(&body);
+        let card = failed
+            .card_for(&runs[0], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        assert!(!card.badges()[1].done);
+
+        assert_eq!(passed.check_of("deleted_since"), CheckState::Unknown);
+    }
+
+    #[test]
+    fn only_a_bot_that_is_running_makes_the_newest_run_running() {
+        let mut open = a_finished_run("now", "mine", "paper", 0);
+        open.finished = false;
+        open.ended_at = String::new();
+        open.change = None;
+        let runs = vec![open, a_finished_run("old", "mine", "paper", 0)];
+
+        let idle = with_student(Value::Null, "สมชาย");
+        assert_eq!(
+            idle.running_run_id(&evidence_of(&runs)),
+            None,
+            "no job: it was killed"
+        );
+        let card = idle
+            .card_for(&runs[0], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        assert_eq!(card.status, submission::RunStatus::Unfinished);
+
+        let going = with_student(job_of("run", "paper", true, None), "สมชาย");
+        assert_eq!(going.running_run_id(&evidence_of(&runs)), Some("now"));
+        let card = going
+            .card_for(&runs[0], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        assert_eq!(card.status, submission::RunStatus::Running);
+        let old = going
+            .card_for(&runs[1], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        assert_eq!(
+            old.status,
+            submission::RunStatus::Finished,
+            "only the newest can be running"
+        );
+
+        let checking = with_student(job_of("check", "testnet", true, None), "สมชาย");
+        assert_eq!(
+            checking.running_run_id(&evidence_of(&runs)),
+            None,
+            "a check makes no run"
+        );
+    }
+
+    #[test]
+    fn a_running_run_is_labelled_in_the_picker() {
+        let mut open = a_finished_run("now", "mine", "paper", 0);
+        open.finished = false;
+        open.change = None;
+        let runs = vec![open];
+        let mut going = with_student(job_of("run", "paper", true, None), "สมชาย");
+        let text = painted_with(&mut going, evidence_of(&runs));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("กำลังรัน") && line.contains("mine")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_is_not_paper_or_testnet_is_never_offered() {
+        let runs = vec![a_finished_run("prod", "mine", "grvt prod", 0)];
+        let control = with_student(Value::Null, "สมชาย");
+        assert!(control.submit_choice(&evidence_of(&runs)).0.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn saving_here_says_why_when_there_is_no_canvas() {
+        // This is the desktop build: there is no browser to draw the picture.
+        let mut control = with_student(Value::Null, "สมชาย");
+        let runs = vec![a_finished_run("a", "mine", "paper", 0)];
+        let card = control
+            .card_for(&runs[0], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        control.start_save(&card, "สมชาย", "สมชาย", 1.0);
+        assert!(
+            control.save_file.starts_with("ส่งงาน_สมชาย_"),
+            "{}",
+            control.save_file
+        );
+        control.drain(1.0);
+        let (line, good) = control.save.line().unwrap();
+        assert!(!good && line.contains("เบราว์เซอร์"), "{line}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn saving_with_a_new_name_also_keeps_the_name() {
+        let runs = vec![a_finished_run("a", "mine", "paper", 0)];
+        let mut control = with_student(Value::Null, "สมชาย");
+        let card = control
+            .card_for(&runs[0], "สมหญิง", &evidence_of(&runs))
+            .unwrap();
+        control.start_save(&card, "สมหญิง", "สมชาย", 1.0);
+        assert!(control.post.is_some_and(|(kind, _)| kind == Kind::Student));
+
+        let mut same = with_student(Value::Null, "สมชาย");
+        let card = same
+            .card_for(&runs[0], "สมชาย", &evidence_of(&runs))
+            .unwrap();
+        same.start_save(&card, "สมชาย", "สมชาย", 1.0);
+        assert!(same.post.is_none(), "an unchanged name is not sent again");
+    }
+
+    #[test]
+    fn the_answer_to_saving_a_name_is_said_beside_the_name_not_among_the_status_lines() {
+        let mut control = with_student(Value::Null, "สมชาย");
+        control.finish(Kind::Student, reply(200, "{}"), 1.0);
+        assert_eq!(
+            control.note.as_ref().map(|note| note.text.as_str()),
+            Some("บันทึกชื่อแล้ว")
+        );
+        let text = painted_with(&mut control, Evidence::default());
+        assert_eq!(
+            text.iter().filter(|line| *line == "บันทึกชื่อแล้ว").count(),
+            1,
+            "once, under the field: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_band_and_the_output_both_fit_the_card() {
+        let runs: Vec<Run> = (0..5)
+            .map(|n| a_finished_run(&format!("r{n}"), "mine", "paper", n))
+            .collect();
+        let mut control = with_student(Value::Null, "สมชาย");
+        control.name_edit = Some("ก".repeat(70));
+        let text = painted_with(&mut control, evidence_of(&runs));
+        assert!(
+            text.iter().any(|line| line == "ข้อความจากรอบล่าสุด"),
+            "the output box is still drawn under the band: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("ชื่อยาวเกิน 60")),
+            "{text:?}"
         );
     }
 }

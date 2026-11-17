@@ -50,7 +50,7 @@ const VIEWS: [(&str, [f32; 5]); 6] = [
     ("ประวัติ", [20.0, 3290.0, 1430.0, 3750.0, 0.0]),
     // Start and stop the bot. Below everything else and drawn only where the
     // board's own server offers it: see `Board::zone_shown`.
-    ("ควบคุม", [20.0, 3800.0, 1160.0, 4600.0, 0.0]),
+    ("ควบคุม", [20.0, 3800.0, 1160.0, 4850.0, 0.0]),
 ];
 
 /// Which of `VIEWS` is the control panel.
@@ -332,7 +332,9 @@ impl Default for Board {
         // The control panel, below the history. Always in the layout so a
         // saved position survives; drawn and counted only when the server
         // has it.
-        slots.insert("control", Slot::new(40.0, 3850.0, 1100.0, 700.0));
+        // Tall enough for the submission card's band (a form and a picture of
+        // the card) under the two columns, with the bot's output below it.
+        slots.insert("control", Slot::new(40.0, 3850.0, 1100.0, 950.0));
         Self {
             // Opens on the market, not zoomed out to fit everything: eleven
             // cards at once is a map, not a screen.
@@ -4401,6 +4403,12 @@ impl Board {
     fn control_card(&mut self, ui: &mut egui::Ui, now: f64) {
         let mut slot = self.slot("control");
         let (state, status) = self.control.state();
+        // The submission card is made of the board's runs and newest ticks,
+        // which the panel does not fetch itself.
+        let evidence = control::Evidence {
+            runs: &self.past.runs,
+            rows: &self.bot.rows,
+        };
         let control = &mut self.control;
         card::show(
             ui,
@@ -4408,7 +4416,7 @@ impl Board {
             "แผงควบคุมบอท",
             &status,
             state,
-            |ui| control.body(ui, now),
+            |ui| control.body(ui, now, evidence),
         );
         self.put("control", slot);
     }

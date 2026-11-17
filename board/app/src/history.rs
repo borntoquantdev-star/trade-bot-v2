@@ -47,6 +47,25 @@ pub struct Run {
     /// never a zero standing in for "unknown".
     #[serde(default)]
     pub change: Option<f64>,
+    /// The account's equity when the run began, as the bot wrote it (a
+    /// string at full precision). With `change` it makes the percentage the
+    /// submission card prints. Empty when the run has no closing line.
+    #[serde(default)]
+    pub first_equity: String,
+    /// The ticks of the audit trail inside the run that sent an order, and
+    /// the ticks that let a position go. The closing line's own `orders` and
+    /// `exits` are the record for a run that has one; these are for the run
+    /// that has not (still going, or killed), whose own counts are absent and
+    /// would otherwise read as no trades at all.
+    #[serde(default)]
+    pub audit_orders: u64,
+    #[serde(default)]
+    pub audit_exits: u64,
+    /// The deepest fall in equity during the run, as a percentage of the high
+    /// before it. `None` when the server could not measure one - never a zero
+    /// standing in for "unknown".
+    #[serde(default)]
+    pub max_drawdown_pct: Option<f64>,
     /// False for a run that was killed before it could write its last line,
     /// and for one that is still going.
     #[serde(default)]

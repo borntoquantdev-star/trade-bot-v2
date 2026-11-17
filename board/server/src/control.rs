@@ -20,6 +20,8 @@
 //! * **Keys go in, never out.** `POST /api/control/keys` merges into
 //!   `config/.env`; nothing returns a value, and the output buffer is
 //!   scrubbed of the two secrets in case a library ever prints one.
+//! * **The one thing that does come back is the student's name** (see
+//!   `student.rs`): it goes on the submission card, so it is not a secret.
 //!
 //! The bot's own text (stdout and stderr, merged) is kept in a ring of the
 //! last 300 lines so the page can show what a terminal would have shown.
@@ -44,6 +46,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 
 use crate::account::{self, Account};
+use crate::student;
 
 /// Lines of output kept. The page shows the tail, as a terminal would.
 pub const RING_LINES: usize = 300;
@@ -252,7 +255,7 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -897,6 +900,7 @@ impl Control {
             .unwrap_or_default();
         let paper = read_halted(self.logs().join("state.paper.json")).await;
         let testnet = read_halted(self.logs().join("state.json")).await;
+        let student = student::read(self.root()).await;
 
         let state = self.lock();
         json!({
@@ -913,6 +917,9 @@ impl Control {
             "output": state.output.to_vec(),
             "keys": key_flags(&env_text),
             "halted": { "paper": paper, "testnet": testnet },
+            // Not a secret, unlike everything else the board keeps on disk:
+            // the name goes back to the page so the field can be filled in.
+            "student": { "name": student },
             "strategies": state.strategies.listing.as_ref().map(|listing| json!({
                 "list": listing.list,
                 "error": listing.error,
@@ -1045,6 +1052,19 @@ impl Control {
                  (ถ้าเพิ่งเขียนใหม่ รอสักครู่แล้วลองอีกครั้ง)",
             ))
         }
+    }
+
+    // -- the student's name -------------------------------------------------
+
+    /// Keep the name the submission card is to carry. `name` has already been
+    /// through `student::clean_name`; an empty one takes the name back off.
+    pub fn save_student(&self, name: &str) -> Result<(), Refusal> {
+        student::write(self.root(), name).map_err(|err| {
+            Refusal::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("เขียน config/student.json ไม่สำเร็จ: {err}"),
+            )
+        })
     }
 
     // -- keys ---------------------------------------------------------------
@@ -1341,11 +1361,15 @@ pub fn merge_env(text: &str, set: &[(&str, &str)], defaults: &[(&str, &str)]) ->
 /// Write beside the file and rename over it, so a crash or a full disk never
 /// leaves half a key behind. If the rename is refused (something has the
 /// file open) fall back to a plain write.
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("env.tmp");
+    // Named after the file it will replace, so two files written this way
+    // (`.env`, `student.json`) never share a temporary.
+    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(".tmp");
+    let temp = path.with_file_name(temp_name);
     std::fs::write(&temp, text)?;
     #[cfg(unix)]
     {
@@ -1637,6 +1661,7 @@ pub fn routes(control: Control, account: Account) -> Router {
         .route("/api/control/check", post(check))
         .route("/api/control/resume", post(resume))
         .route("/api/control/keys", post(keys))
+        .route("/api/control/student", post(student_name))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn(guard))
         .with_state(Ctx { control, account })
@@ -1700,6 +1725,24 @@ async fn stop(State(ctx): State<Ctx>) -> Response {
     match ctx.control.stop() {
         Ok(()) => done(&ctx).await,
         Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// Store the name for the submission card. Everything the keys route does to
+/// be careful with a secret is unnecessary here, but the door is the same:
+/// the guard in front of this router has already checked Host, Origin and the
+/// control header.
+async fn student_name(State(ctx): State<Ctx>, body: Bytes) -> Response {
+    let name = match student::parse_request(&body) {
+        Ok(name) => name,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let control = ctx.control.clone();
+    let saved = tokio::task::spawn_blocking(move || control.save_student(&name)).await;
+    match saved {
+        Ok(Ok(())) => done(&ctx).await,
+        Ok(Err(refusal)) => refusal.into_response(),
+        Err(_) => Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "บันทึกชื่อไม่สำเร็จ").into_response(),
     }
 }
 

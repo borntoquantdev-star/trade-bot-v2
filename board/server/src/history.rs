@@ -43,6 +43,7 @@ pub async fn runs(State(config): State<Config>) -> Json<Value> {
     }
     let mut value = collect_runs(&recorded);
     merge_inferred(&mut value, &trail);
+    add_measures(&mut value, &trail);
     Json(value)
 }
 
@@ -141,6 +142,159 @@ pub fn collect_runs(text: &str) -> Value {
         "total": total,
         "unreadable": unreadable,
     })
+}
+
+// --- what the trail shows inside a run ---------------------------------------
+
+/// What one pass over the audit trail keeps: the equity readings, and the
+/// ticks that sent an order or let a position go.
+#[derive(Default)]
+struct Scan {
+    /// Seconds since the epoch and the equity, oldest first.
+    equity: Vec<(i64, f64)>,
+    /// Seconds since the epoch, whether the tick sent an order, whether it
+    /// exited. Only ticks that did one of the two, oldest first.
+    trades: Vec<(i64, bool, bool)>,
+}
+
+/// Read the trail once for the two things a run is measured by.
+///
+/// A tick that could not read the account writes an equity of zero, and a
+/// zero would turn any run into one that lost everything, so zeros and
+/// anything unreadable are left out of the equity - the same rule the
+/// calendar keeps.
+///
+/// Reads three fields of each line and lets serde skip the rest, because a
+/// line carries a trace fifteen times the size of the part wanted here.
+fn scan_trail(trail: &str) -> Scan {
+    #[derive(serde::Deserialize)]
+    struct Tick {
+        at: Option<String>,
+        equity: Option<String>,
+        order: Option<serde::de::IgnoredAny>,
+        exit: Option<serde::de::IgnoredAny>,
+    }
+    let mut scan = Scan::default();
+    for line in trail.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(tick) = serde_json::from_str::<Tick>(line) else {
+            continue;
+        };
+        let Some(at) = tick.at.as_deref().and_then(epoch_seconds) else {
+            continue;
+        };
+        let equity = tick
+            .equity
+            .as_deref()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .filter(|equity| equity.is_finite() && *equity > 0.0);
+        if let Some(equity) = equity {
+            scan.equity.push((at, equity));
+        }
+        if tick.order.is_some() || tick.exit.is_some() {
+            scan.trades
+                .push((at, tick.order.is_some(), tick.exit.is_some()));
+        }
+    }
+    // The trail is appended in order, but a clock that stepped back would
+    // put a reading before its predecessor, and the window lookups below
+    // assume order.
+    scan.equity.sort_by_key(|(at, _)| *at);
+    scan.trades.sort_by_key(|(at, _, _)| *at);
+    scan
+}
+
+/// The deepest fall from a high to a later low, as a percentage of that high,
+/// over the readings from `start` to `end` (inclusive; `None` = no end).
+///
+/// `None` when the window holds fewer than two readings: a fall needs a before
+/// and an after, and "no data" printed as `0` would be the lie a drawdown
+/// figure is there to prevent. It is a fall in **equity**, so it includes
+/// profit and loss that has not been realised - the same number the `change`
+/// of a run is made of.
+pub fn max_drawdown_pct(series: &[(i64, f64)], start: i64, end: Option<i64>) -> Option<f64> {
+    let from = series.partition_point(|(at, _)| *at < start);
+    let to = match end {
+        Some(end) => series.partition_point(|(at, _)| *at <= end),
+        None => series.len(),
+    };
+    let window = series.get(from..to)?;
+    if window.len() < 2 {
+        return None;
+    }
+    let mut peak = window[0].1;
+    let mut deepest = 0.0_f64;
+    for (_, equity) in window {
+        peak = peak.max(*equity);
+        deepest = deepest.max((peak - equity) / peak * 100.0);
+    }
+    Some(deepest)
+}
+
+/// How many ticks of the trail inside the window sent an order, and how many
+/// let a position go.
+pub fn trades_in(trades: &[(i64, bool, bool)], start: i64, end: Option<i64>) -> (u64, u64) {
+    let from = trades.partition_point(|(at, _, _)| *at < start);
+    let to = match end {
+        Some(end) => trades.partition_point(|(at, _, _)| *at <= end),
+        None => trades.len(),
+    };
+    trades
+        .get(from..to)
+        .unwrap_or_default()
+        .iter()
+        .fold((0, 0), |(orders, exits), (_, order, exit)| {
+            (orders + u64::from(*order), exits + u64::from(*exit))
+        })
+}
+
+/// Give every run what the trail shows inside its own window:
+///
+/// * `max_drawdown_pct` - a number, or `null` when it cannot be measured;
+/// * `audit_orders` and `audit_exits` - the ticks that sent an order and the
+///   ticks that let a position go. **The closing line's own counts are the
+///   record for a run that has one**; these exist for the run that has not
+///   (still going, or killed), whose `orders` and `exits` are otherwise
+///   absent and would read as zero trades.
+///
+/// A run with no closing line is cut off where the next run begins, not
+/// extended to the end of the trail: a killed run's readings stop when the
+/// bot was started again, and counting the next run's ticks as its own would
+/// charge it with falls and trades it never had.
+pub fn add_measures(value: &mut Value, trail: &str) {
+    let scan = scan_trail(trail);
+    let Some(runs) = value["runs"].as_array_mut() else {
+        return;
+    };
+    let mut starts: Vec<i64> = runs
+        .iter()
+        .filter_map(|run| epoch_seconds(run["started_at"].as_str()?))
+        .collect();
+    starts.sort_unstable();
+    for run in runs.iter_mut() {
+        let start = run["started_at"].as_str().and_then(epoch_seconds);
+        let end = run["ended_at"].as_str().and_then(epoch_seconds);
+        let window = start.map(|start| {
+            let end = end.or_else(|| {
+                starts
+                    .iter()
+                    .copied()
+                    .find(|next| *next > start)
+                    .map(|next| next - 1)
+            });
+            (start, end)
+        });
+        run["max_drawdown_pct"] =
+            match window.and_then(|(start, end)| max_drawdown_pct(&scan.equity, start, end)) {
+                Some(pct) => json!(pct),
+                None => Value::Null,
+            };
+        let (orders, exits) = match window {
+            Some((start, end)) => trades_in(&scan.trades, start, end),
+            None => (0, 0),
+        };
+        run["audit_orders"] = json!(orders);
+        run["audit_exits"] = json!(exits);
+    }
 }
 
 /// The shortest silence that counts as "the bot stopped and was started
@@ -789,5 +943,216 @@ mod tests {
         assert_eq!(epoch_seconds("2026-11-13T16:47:11Z"), want);
         assert_eq!(epoch_seconds("2026-11-13T23:47:11+07:00"), want);
         assert_eq!(epoch_seconds("nonsense"), None);
+    }
+
+    // ------------------------------------------------------------ drawdown
+
+    fn tick(at: &str, equity: &str) -> String {
+        format!(
+            r#"{{"at":"{at}","symbol":"BTC_USDT_Perp","price":"100","equity":"{equity}","trace":{{"calls":[]}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_fall_is_measured_from_the_high_before_it_not_from_the_start() {
+        // Up to 110, down to 99, back to 105: the fall is 11 from 110, which
+        // is 10 percent. The first reading (100) is not what it is compared to.
+        let series = [(1, 100.0), (2, 110.0), (3, 99.0), (4, 105.0)];
+        let pct = max_drawdown_pct(&series, 0, None).unwrap();
+        assert!((pct - 10.0).abs() < 1e-9, "{pct}");
+    }
+
+    #[test]
+    fn a_climb_with_no_dip_is_a_measured_zero_not_a_missing_number() {
+        let series = [(1, 100.0), (2, 101.0), (3, 105.0)];
+        assert_eq!(max_drawdown_pct(&series, 0, None), Some(0.0));
+    }
+
+    #[test]
+    fn one_reading_cannot_fall_so_it_says_nothing() {
+        assert_eq!(max_drawdown_pct(&[(1, 100.0)], 0, None), None);
+        assert_eq!(max_drawdown_pct(&[], 0, None), None);
+        // Two readings, but only one inside the window.
+        assert_eq!(max_drawdown_pct(&[(1, 100.0), (9, 50.0)], 0, Some(5)), None);
+    }
+
+    #[test]
+    fn only_the_readings_inside_the_window_count() {
+        let series = [(1, 200.0), (10, 100.0), (11, 90.0), (20, 50.0)];
+        let pct = max_drawdown_pct(&series, 10, Some(11)).unwrap();
+        assert!(
+            (pct - 10.0).abs() < 1e-9,
+            "the 200 before and the 50 after are not this run: {pct}"
+        );
+    }
+
+    #[test]
+    fn zero_and_unreadable_equity_never_become_a_total_loss() {
+        let trail = [
+            tick("2026-11-13T16:47:00+00:00", "100"),
+            tick("2026-11-13T16:47:05+00:00", "0"),
+            tick("2026-11-13T16:47:10+00:00", "oops"),
+            tick("2026-11-13T16:47:15+00:00", "95"),
+            "not json at all".to_owned(),
+            r#"{"at":"2026-11-13T16:47:20+00:00","equity":96.5}"#.to_owned(),
+        ]
+        .join("\n");
+        let series = scan_trail(&trail).equity;
+        assert_eq!(series.len(), 2, "{series:?}");
+        let pct = max_drawdown_pct(&series, 0, None).unwrap();
+        assert!((pct - 5.0).abs() < 1e-9, "{pct}");
+    }
+
+    #[test]
+    fn every_run_gets_the_fall_of_its_own_window() {
+        let trail = [
+            tick("2026-11-13T16:47:10+00:00", "100"),
+            tick("2026-11-13T16:47:20+00:00", "90"),
+            tick("2026-11-13T16:47:30+00:00", "95"),
+            // The second run, which never fell.
+            tick("2026-11-13T17:00:10+00:00", "200"),
+            tick("2026-11-13T17:00:20+00:00", "210"),
+        ]
+        .join("\n");
+        let mut value = collect_runs(LOG);
+        add_measures(&mut value, &trail);
+        let runs = value["runs"].as_array().unwrap();
+        let first = runs.iter().find(|run| run["id"] == "aaa").unwrap();
+        let second = runs.iter().find(|run| run["id"] == "bbb").unwrap();
+        // aaa runs 16:47:00 to 16:48:01 and holds 100, 90, 95.
+        assert!((first["max_drawdown_pct"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        // bbb has no end line, so it runs to the end of the trail and holds
+        // 200 and 210 only.
+        assert_eq!(second["max_drawdown_pct"].as_f64(), Some(0.0));
+    }
+
+    /// The killed run ends where the next one starts, so the next run's
+    /// ticks - and their falls - are not charged to it.
+    #[test]
+    fn a_run_that_was_killed_stops_where_the_next_one_begins() {
+        let log = r#"
+{"id":"k","event":"start","at":"2026-11-13T10:00:00+00:00","strategy":"ping_pong","mode":"paper"}
+{"id":"n","event":"start","at":"2026-11-13T11:00:00+00:00","strategy":"ping_pong","mode":"paper"}
+{"id":"n","event":"end","at":"2026-11-13T11:10:00+00:00","ticks":2,"orders":0,"exits":0,"rejects":0,"first_equity":"50","last_equity":"20","halted":false,"reason":"x"}
+"#;
+        let trail = [
+            tick("2026-11-13T10:01:00+00:00", "100"),
+            tick("2026-11-13T10:02:00+00:00", "98"),
+            tick("2026-11-13T11:01:00+00:00", "50"),
+            tick("2026-11-13T11:02:00+00:00", "20"),
+        ]
+        .join("\n");
+        let mut value = collect_runs(log);
+        add_measures(&mut value, &trail);
+        let killed = value["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["id"] == "k")
+            .unwrap();
+        let pct = killed["max_drawdown_pct"].as_f64().unwrap();
+        assert!((pct - 2.0).abs() < 1e-9, "{pct}");
+    }
+
+    /// A tick that sent an order and one that let a position go, as the bot
+    /// writes them (the contents do not matter here, only that they are there).
+    fn trade_tick(at: &str, kind: &str) -> String {
+        format!(r#"{{"at":"{at}","equity":"100","{kind}":{{"side":"buy"}}}}"#)
+    }
+
+    #[test]
+    fn the_trail_counts_the_trades_inside_a_window_and_no_others() {
+        let trail = [
+            trade_tick("2026-11-13T10:00:00+00:00", "order"),
+            trade_tick("2026-11-13T10:01:00+00:00", "order"),
+            trade_tick("2026-11-13T10:02:00+00:00", "exit"),
+            tick("2026-11-13T10:03:00+00:00", "100"),
+            trade_tick("2026-11-13T10:04:00+00:00", "order"),
+            trade_tick("2026-11-13T10:05:00+00:00", "exit"),
+        ]
+        .join("\n");
+        let scan = scan_trail(&trail);
+        let at = |text: &str| epoch_seconds(text).unwrap();
+        assert_eq!(
+            trades_in(
+                &scan.trades,
+                at("2026-11-13T10:01:00+00:00"),
+                Some(at("2026-11-13T10:04:00+00:00"))
+            ),
+            (2, 1),
+            "ends are inclusive and the rest is left out"
+        );
+        assert_eq!(trades_in(&scan.trades, 0, None), (3, 2));
+        assert_eq!(trades_in(&scan.trades, i64::MAX - 1, None), (0, 0));
+    }
+
+    /// The run that is still going has no closing line, so its own `orders`
+    /// and `exits` are absent; the trail says what it has done so far.
+    #[test]
+    fn a_run_with_no_closing_line_still_has_the_trades_the_trail_shows() {
+        let log = r#"
+{"id":"live","event":"start","at":"2026-11-13T10:00:00+00:00","strategy":"mine","mode":"paper"}
+"#;
+        let trail = [
+            trade_tick("2026-11-13T10:01:00+00:00", "order"),
+            trade_tick("2026-11-13T10:02:00+00:00", "exit"),
+            trade_tick("2026-11-13T10:03:00+00:00", "order"),
+        ]
+        .join("\n");
+        let mut value = collect_runs(log);
+        add_measures(&mut value, &trail);
+        let run = &value["runs"][0];
+        assert_eq!(run["finished"], false);
+        assert!(
+            run["orders"].is_null(),
+            "the closing line's count is still absent"
+        );
+        assert_eq!(run["audit_orders"], 2);
+        assert_eq!(run["audit_exits"], 1);
+    }
+
+    #[test]
+    fn trades_of_the_run_before_are_not_charged_to_a_killed_run() {
+        let log = r#"
+{"id":"k","event":"start","at":"2026-11-13T10:00:00+00:00","strategy":"mine","mode":"paper"}
+{"id":"n","event":"start","at":"2026-11-13T11:00:00+00:00","strategy":"mine","mode":"paper"}
+"#;
+        let trail = [
+            trade_tick("2026-11-13T10:30:00+00:00", "order"),
+            trade_tick("2026-11-13T11:30:00+00:00", "order"),
+            trade_tick("2026-11-13T11:31:00+00:00", "order"),
+        ]
+        .join("\n");
+        let mut value = collect_runs(log);
+        add_measures(&mut value, &trail);
+        let count = |id: &str| {
+            value["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|run| run["id"] == id)
+                .map(|run| run["audit_orders"].as_u64().unwrap())
+        };
+        assert_eq!(count("k"), Some(1));
+        assert_eq!(count("n"), Some(2));
+    }
+
+    #[test]
+    fn with_no_trail_the_counts_are_zero_which_is_true_of_a_run_with_no_ticks() {
+        let mut value = collect_runs(LOG);
+        add_measures(&mut value, "");
+        for run in value["runs"].as_array().unwrap() {
+            assert_eq!(run["audit_orders"], 0);
+            assert_eq!(run["audit_exits"], 0);
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_readings_has_a_null_drawdown_not_a_zero() {
+        let mut value = collect_runs(LOG);
+        add_measures(&mut value, "");
+        for run in value["runs"].as_array().unwrap() {
+            assert!(run["max_drawdown_pct"].is_null(), "{run}");
+        }
     }
 }

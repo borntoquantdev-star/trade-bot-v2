@@ -57,6 +57,16 @@ web-sys = { version = "0.3", features = [
     "Storage",
     # The #zone a link can open the board on: see Board::open_at.
     "Location",
+    # The submission card, drawn on a canvas that is never in the page and
+    # saved as a PNG: see src/submission_web.rs. The clipboard is reached by
+    # reflection (it is an unstable web-sys API), so it needs no feature here.
+    "CanvasRenderingContext2d",
+    "TextMetrics",
+    "Blob",
+    "Url",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "Node",
 ] }
 # The wall clock in the top bar: see src/time.rs. Already in the tree
 # under web-sys; named here so the board can call it.

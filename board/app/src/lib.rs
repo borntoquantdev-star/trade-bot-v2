@@ -24,6 +24,9 @@ pub mod market;
 pub mod marks;
 pub mod shape;
 pub mod store;
+pub mod submission;
+#[cfg(target_arch = "wasm32")]
+mod submission_web;
 pub mod theme;
 pub mod time;
 pub mod traces;
