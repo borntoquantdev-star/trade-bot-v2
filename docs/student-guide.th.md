@@ -68,7 +68,7 @@
 3. **ปลั๊กอิน `bot`** — พิมพ์ใน Claude Code บรรทัดเดียว
 
    ```
-   /plugin install bot --marketplace borntoquantdev-star/bot-trade-studio
+   /plugin install bot --marketplace borntoquantdev-star/bot-trade-studio-v2
    ```
 
 แล้วพิมพ์ `/bot:home` — ถ้าเห็นมันถามว่าตอนนี้อยู่ขั้นไหน แปลว่าพร้อมแล้ว
@@ -437,7 +437,7 @@ tradebot --live --config config/testnet.yaml --iterations 24 --close-at-end
   `board\pack.ps1` แล้ว `tools\student-kit.ps1` → `board\pack\student-kit.zip`
   (โค้ดบอท + บอร์ดพกพา + `00-START-HERE.txt` สคริปต์ตรวจแล้วว่าไม่มี `.env` / `logs` ติดไป)
   ในชุดมีโฟลเดอร์ `bot-trade-studio` (ปลั๊กอินรุ่นในเครื่องผู้สอน) ด้วย นักเรียนติดตั้งจากโฟลเดอร์ได้
-  `/plugin marketplace add <พาธเต็มของ bot-trade-studio>` แล้ว `/plugin install bot@bot-trade-studio-marketplace`
+  `/plugin marketplace add <พาธเต็มของ bot-trade-studio>` แล้ว `/plugin install bot@bot-trade-studio-v2`
 - ใบงานสำหรับคาบ: `docs/student-lab.th.md`
 - เปิด `#trip` ตอนรันขั้น 6 หน้าห้อง: เห็นออเดอร์เดินทางจนจับคู่ภายในไม่กี่ร้อย ms
 - ประโยคที่ควรพูดซ้ำ: **"บอทที่ดีส่วนใหญ่ไม่ทำอะไร"** และ **"ping_pong ไม่ใช่กลยุทธ์"**

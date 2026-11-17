@@ -111,7 +111,7 @@ $readme = @'
 ติดตั้งปลั๊กอิน /bot:* จากชุดนี้ (ถ้ามีโฟลเดอร์ bot-trade-studio อยู่ข้างๆ trade-bot):
     เปิด Claude Code ในโฟลเดอร์ trade-bot แล้วพิมพ์ทีละบรรทัด
     /plugin marketplace add <พาธเต็มของโฟลเดอร์ bot-trade-studio>
-    /plugin install bot@bot-trade-studio-marketplace
+    /plugin install bot@bot-trade-studio-v2
 
 ลองของโดยไม่ต้องมีกุญแจ:
     .venv\Scripts\tradebot.exe --dry-run --paper-live --config config\demo.yaml --iterations 36

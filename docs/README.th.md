@@ -33,7 +33,7 @@ exchange: grvt        # หรือ hyperliquid
 ### Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/borntoquantdev-star/trade-bot.git
+git clone https://github.com/borntoquantdev-star/trade-bot-v2.git
 cd trade-bot
 
 python -m venv .venv
@@ -59,7 +59,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/borntoquantdev-star/trade-bot.git
+git clone https://github.com/borntoquantdev-star/trade-bot-v2.git
 cd trade-bot
 
 python3 -m venv .venv

@@ -7,7 +7,7 @@ expects, so Codex, Claude Code and Copilot all read the same rules.
 ## 1. Open the project
 
 ```bash
-git clone https://github.com/borntoquantdev-star/trade-bot.git
+git clone https://github.com/borntoquantdev-star/trade-bot-v2.git
 cd trade-bot
 code .
 ```

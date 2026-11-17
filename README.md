@@ -42,7 +42,7 @@ Nothing else. The core package depends on PyYAML alone.
 ### Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/borntoquantdev-star/trade-bot.git
+git clone https://github.com/borntoquantdev-star/trade-bot-v2.git
 cd trade-bot
 
 python -m venv .venv
@@ -71,7 +71,7 @@ or skip activation entirely and keep calling `.venv\Scripts\tradebot.exe` and
 ### macOS and Linux
 
 ```bash
-git clone https://github.com/borntoquantdev-star/trade-bot.git
+git clone https://github.com/borntoquantdev-star/trade-bot-v2.git
 cd trade-bot
 
 python3 -m venv .venv

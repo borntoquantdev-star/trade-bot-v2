@@ -49,8 +49,8 @@ dev = [
 tradebot = "tradebot.cli.main:main"
 
 [project.urls]
-Homepage = "https://github.com/borntoquantdev-star/trade-bot"
-Repository = "https://github.com/borntoquantdev-star/trade-bot"
+Homepage = "https://github.com/borntoquantdev-star/trade-bot-v2"
+Repository = "https://github.com/borntoquantdev-star/trade-bot-v2"
 
 [tool.setuptools.packages.find]
 include = ["tradebot*"]
