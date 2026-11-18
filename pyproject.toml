@@ -36,6 +36,11 @@ hyperliquid = [
   "hyperliquid-python-sdk>=0.9.0",
   "eth-account>=0.10.0",
 ]
+# What `tradebot --check` needs to run a strategy's tests: its TESTS layer
+# calls `python -m pytest`, so TradeBot.exe installs this with the bot.
+test = [
+  "pytest>=7.0.0",
+]
 dev = [
   "pytest>=7.0.0",
   "pytest-cov>=4.0.0",

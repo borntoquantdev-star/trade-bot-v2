@@ -496,7 +496,9 @@ impl Control {
                 .to_vec(),
             // The grvt extra is what testnet trading imports; without it a
             // "testnet" run would stop at "the GRVT SDK is not installed".
-            ["pip", "install", "--python", python, "-e", ".[grvt]"]
+            // The test extra is pytest, which the TESTS layer of `--check`
+            // runs; without it no strategy can pass the gate.
+            ["pip", "install", "--python", python, "-e", ".[grvt,test]"]
                 .map(str::to_owned)
                 .to_vec(),
         ];
