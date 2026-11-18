@@ -503,7 +503,9 @@ pub struct Card {
     /// The student wrote the strategy: it is not one of the two case studies.
     pub own: bool,
     pub case_study: bool,
-    /// What the strategy's check says now (not what it said that day).
+    /// Did the strategy pass its check. A testnet run since the bot's gate
+    /// went in passed by being there ([`check_of`]); otherwise what the
+    /// check says now, not what it said that day.
     pub check: CheckState,
     pub trades: u64,
     pub duration_secs: Option<u64>,
@@ -558,7 +560,7 @@ pub fn build(input: &Inputs) -> Option<Card> {
         status,
         own: !case_study,
         case_study,
-        check: input.check,
+        check: check_of(run, mode, input.check),
         trades,
         duration_secs: duration_of(run, status, input.now_unix),
         pl_tenths: pl,
@@ -567,6 +569,31 @@ pub fn build(input: &Inputs) -> Option<Card> {
         code,
         chart: chart_of(run, input.rows),
     })
+}
+
+/// When `--live` started refusing to trade until `--check` had passed on the
+/// same file and market (bot commit 4b50a04, 16 Nov 2026 22:30 Thai time).
+const LIVE_GATE_SINCE: &str = "2026-11-16T15:30:23+00:00";
+
+/// The check badge of a run.
+///
+/// A testnet run that started once the gate was in could only start because
+/// the check had passed, so it is passed even if the file was edited later
+/// and the check now says otherwise. A paper run is not gated, and a testnet
+/// run from before the gate proves nothing: both take what the check says now.
+pub fn check_of(run: &Run, mode: CardMode, now: CheckState) -> CheckState {
+    let gated = match (
+        time::utc_seconds(&run.started_at),
+        time::utc_seconds(LIVE_GATE_SINCE),
+    ) {
+        (Some(started), Some(gate)) => started >= gate,
+        _ => false,
+    };
+    if mode == CardMode::Testnet && gated {
+        CheckState::Passed
+    } else {
+        now
+    }
 }
 
 /// Which badge.
@@ -1959,6 +1986,42 @@ mod tests {
         let unknown = card_of(&run(), CheckState::Unknown).badges();
         assert!(!unknown[1].done);
         assert_eq!(unknown[1].why, Some("ยังไม่ทราบผล"));
+    }
+
+    #[test]
+    fn a_testnet_run_since_the_gate_passed_whatever_the_check_says_now() {
+        let testnet = Run {
+            mode: "grvt testnet".into(),
+            ..run()
+        };
+        for now in [CheckState::NotPassed, CheckState::Unknown] {
+            let badges = card_of(&testnet, now).badges();
+            assert!(badges[1].done);
+            assert_eq!(badges[1].why, None);
+        }
+    }
+
+    #[test]
+    fn a_paper_run_still_follows_the_check_as_it_is_now() {
+        let badges = card_of(&run(), CheckState::NotPassed).badges();
+        assert!(!badges[1].done);
+        assert_eq!(badges[1].why, Some("ยังไม่ผ่าน"));
+    }
+
+    #[test]
+    fn a_testnet_run_from_before_the_gate_proves_nothing() {
+        let old = Run {
+            mode: "grvt testnet".into(),
+            started_at: "2026-11-16T15:30:22+00:00".into(),
+            ..run()
+        };
+        assert!(!card_of(&old, CheckState::NotPassed).badges()[1].done);
+        assert!(card_of(&old, CheckState::Passed).badges()[1].done);
+        let at_the_gate = Run {
+            started_at: LIVE_GATE_SINCE.into(),
+            ..old
+        };
+        assert!(card_of(&at_the_gate, CheckState::NotPassed).badges()[1].done);
     }
 
     #[test]
