@@ -4,7 +4,7 @@
 //! that `submission::layout` produced on an off-screen canvas, ask the browser
 //! for a PNG, and hand it over twice: as a download, and - if the browser
 //! allows it - on the clipboard, so that a student can paste it straight into
-//! LINE. Where anything goes (every position, every word, every colour) is
+//! Discord. Where anything goes (every position, every word, every colour) is
 //! decided in `submission.rs` and tested there. Nothing in this file decides
 //! what the card says.
 //!

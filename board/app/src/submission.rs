@@ -1357,7 +1357,7 @@ impl SaveStatus {
             SaveStatus::Working => Some(("กำลังสร้างรูป...".to_owned(), true)),
             SaveStatus::Saved { copy, .. } => Some(match copy {
                 CopyState::Pending => ("บันทึกแล้ว · กำลังคัดลอก...".to_owned(), true),
-                CopyState::Done => ("บันทึกแล้ว · คัดลอกไว้แล้ว วางใน LINE ได้เลย".to_owned(), true),
+                CopyState::Done => ("บันทึกแล้ว · คัดลอกไว้แล้ว วางในห้องส่งงานของ Discord ได้เลย".to_owned(), true),
                 CopyState::Unavailable => (
                     "บันทึกแล้ว · คัดลอกอัตโนมัติไม่ได้ ใช้ไฟล์ในโฟลเดอร์ดาวน์โหลดส่งแทน".to_owned(),
                     true,
@@ -2486,7 +2486,7 @@ mod tests {
         status.apply(SaveEvent::Copied, "a.png");
         assert_eq!(
             status.line(),
-            Some(("บันทึกแล้ว · คัดลอกไว้แล้ว วางใน LINE ได้เลย".to_owned(), true))
+            Some(("บันทึกแล้ว · คัดลอกไว้แล้ว วางในห้องส่งงานของ Discord ได้เลย".to_owned(), true))
         );
     }
 
